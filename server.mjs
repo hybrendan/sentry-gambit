@@ -57,6 +57,8 @@ const STARTING_TIMES = new Set(
 );
 const INCREMENTS = new Map([[15 * 60 * 1000, 10_000]]);
 const IDLE_ROOM_TTL = 60 * 60 * 1000;
+const CORRESPONDENCE_TURN_MS = 24 * 60 * 60 * 1000;
+const CORRESPONDENCE_GAME_TTL = 30 * 24 * 60 * 60 * 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BOT_THINK_MS = 500;
 const BOTS = {
@@ -276,7 +278,7 @@ function captureFinishedGame(table) {
  * service must run as a single instance (Cloud Run --max-instances=1). */
 const tables = new Map();
 
-function createTable(id, initialTimeMs = DEFAULT_STARTING_TIME) {
+function createTable(id, initialTimeMs = DEFAULT_STARTING_TIME, mode = "live") {
   const gameId = randomUUID();
   const table = {
     id,
@@ -284,8 +286,11 @@ function createTable(id, initialTimeMs = DEFAULT_STARTING_TIME) {
     chess: new Chess(),
     clients: new Set(),
     seats: { w: null, b: null },
+    playerNames: { w: null, b: null },
     seatOrder: randomInt(2) === 0 ? ["w", "b"] : ["b", "w"],
     result: null,
+    mode,
+    turnStartedAt: null,
     initialTimeMs,
     clock: { w: initialTimeMs, b: initialTimeMs, running: null, since: null },
     gradedPlies: new Set(),
@@ -306,6 +311,8 @@ function createTable(id, initialTimeMs = DEFAULT_STARTING_TIME) {
     fen: table.chess.fen(),
     clock: table.clock,
     initialTimeMs: table.initialTimeMs,
+    mode: table.mode,
+    turnStartedAt: table.turnStartedAt,
   });
   return table;
 }
@@ -328,8 +335,11 @@ function restoreTable(id, saved) {
     chess,
     clients: new Set(),
     seats: { w: null, b: null },
+    playerNames: saved.players ?? { w: null, b: null },
     seatOrder: randomInt(2) === 0 ? ["w", "b"] : ["b", "w"],
     result: null,
+    mode: saved.mode ?? "live",
+    turnStartedAt: saved.turnStartedAt ?? null,
     initialTimeMs: saved.initialTimeMs ?? DEFAULT_STARTING_TIME,
     clock: { w: saved.clock.w, b: saved.clock.b, running: null, since: null },
     gradedPlies: new Set(),
@@ -358,7 +368,7 @@ function restoreTable(id, saved) {
 
 const pendingRestores = new Map();
 
-function obtainTable(roomId, initialTimeMs) {
+function obtainTable(roomId, initialTimeMs, mode) {
   const existing = tables.get(roomId);
   if (existing) return existing;
   const pending = pendingRestores.get(roomId);
@@ -366,7 +376,11 @@ function obtainTable(roomId, initialTimeMs) {
   const promise = (async () => {
     let table = null;
     try {
-      const saved = await gameStore.getLiveGame(roomId, IDLE_ROOM_TTL);
+      const saved = await gameStore.getLiveGame(
+        roomId,
+        IDLE_ROOM_TTL,
+        CORRESPONDENCE_GAME_TTL,
+      );
       if (saved) table = restoreTable(roomId, saved);
     } catch (error) {
       console.error(
@@ -374,7 +388,7 @@ function obtainTable(roomId, initialTimeMs) {
         error,
       );
     }
-    table ??= createTable(roomId, initialTimeMs);
+    table ??= createTable(roomId, initialTimeMs, mode);
     tables.set(roomId, table);
     return table;
   })().finally(() => pendingRestores.delete(roomId));
@@ -437,11 +451,16 @@ function serializeTable(table) {
       promotion: move.promotion,
     })),
     players: {
-      w: table.seats.w?.name ?? null,
-      b: table.seats.b?.name ?? null,
+      w: table.seats.w?.name ?? table.playerNames.w,
+      b: table.seats.b?.name ?? table.playerNames.b,
     },
     result: table.result,
     initialTimeMs: table.initialTimeMs,
+    mode: table.mode,
+    turnDeadlineAt:
+      table.mode === "correspondence" && table.turnStartedAt
+        ? table.turnStartedAt + CORRESPONDENCE_TURN_MS
+        : null,
     clock: table.clock,
     bot: table.bot ?? null,
     coach: table.coach ?? false,
@@ -477,6 +496,11 @@ function broadcast(table) {
 }
 
 function pauseClock(table, now = Date.now()) {
+  if (table.mode === "correspondence") {
+    table.clock.running = null;
+    table.clock.since = null;
+    return;
+  }
   const running = table.clock.running;
   if (running && table.clock.since !== null) {
     table.clock[running] = Math.max(
@@ -489,6 +513,18 @@ function pauseClock(table, now = Date.now()) {
 }
 
 function resumeClock(table, now = Date.now()) {
+  if (table.mode === "correspondence") {
+    const hasPlayers =
+      table.bot ||
+      (new Set(table.playerColors.values()).has("w") &&
+        new Set(table.playerColors.values()).has("b"));
+    if (!table.result && hasPlayers) {
+      table.turnStartedAt ??= now;
+      table.clock.running = table.chess.turn();
+      table.clock.since = table.turnStartedAt;
+    }
+    return;
+  }
   if (!table.result && table.seats.w && table.seats.b && table.chess.history().length) {
     table.clock.running = table.chess.turn();
     table.clock.since = now;
@@ -496,6 +532,18 @@ function resumeClock(table, now = Date.now()) {
 }
 
 function flagIfExpired(table, now = Date.now()) {
+  if (
+    table.mode === "correspondence" &&
+    !table.result &&
+    table.turnStartedAt !== null &&
+    now - table.turnStartedAt >= CORRESPONDENCE_TURN_MS
+  ) {
+    const running = table.chess.turn();
+    table.clock[running] = 0;
+    table.result = `${running === "w" ? "Black" : "White"} wins on time`;
+    pauseClock(table);
+    return true;
+  }
   const running = table.clock.running;
   if (!running || table.clock.since === null || table.result) return false;
   const remaining = table.clock[running] - (now - table.clock.since);
@@ -554,6 +602,11 @@ function applyUndo(table, color) {
   const now = Date.now();
   pauseClock(table, now);
   for (let i = 0; i < plies; i++) table.chess.undo();
+  if (table.mode === "correspondence") {
+    table.turnStartedAt = now;
+    table.clock.w = CORRESPONDENCE_TURN_MS;
+    table.clock.b = CORRESPONDENCE_TURN_MS;
+  }
   const newLength = table.chess.history().length;
   for (const ply of [...table.gradedPlies]) {
     if (ply > newLength) {
@@ -568,6 +621,7 @@ function applyUndo(table, color) {
     newLength + 1,
     table.chess.fen(),
     table.clock,
+    table.turnStartedAt,
   );
   logGameEvent(table, "chess.move.undone", {
     "chess.room.id": table.id,
@@ -635,6 +689,11 @@ function playMove(table, move, movedByBot) {
   table.drawOffer = null;
   table.clock[acceptedMove.color] += INCREMENTS.get(table.initialTimeMs) ?? 0;
   setBoardResult(table);
+  if (table.mode === "correspondence") {
+    table.clock.w = CORRESPONDENCE_TURN_MS;
+    table.clock.b = CORRESPONDENCE_TURN_MS;
+    table.turnStartedAt = now;
+  }
   if (!table.result) resumeClock(table, now);
   const ply = table.chess.history().length;
   gameStore.recordMove(
@@ -643,6 +702,7 @@ function playMove(table, move, movedByBot) {
     acceptedMove,
     table.chess.fen(),
     table.clock,
+    table.turnStartedAt,
   );
   logGameEvent(table, "chess.move.accepted", {
     "chess.room.id": table.id,
@@ -922,12 +982,17 @@ function resetTable(table, swapSeats) {
     running: null,
     since: null,
   };
+  table.turnStartedAt = null;
   table.gradedPlies.clear();
   table.moveGrades.clear();
   table.moveAnalyses.clear();
   table.moveReviewLosses.clear();
   if (swapSeats && !table.bot) {
     [table.seats.w, table.seats.b] = [table.seats.b, table.seats.w];
+    [table.playerNames.w, table.playerNames.b] = [
+      table.playerNames.b,
+      table.playerNames.w,
+    ];
     for (const color of ["w", "b"]) {
       const seated = table.seats[color];
       if (seated?.socket) seated.role = color;
@@ -939,10 +1004,12 @@ function resetTable(table, swapSeats) {
     fen: table.chess.fen(),
     clock: table.clock,
     initialTimeMs: table.initialTimeMs,
+    mode: table.mode,
+    turnStartedAt: table.turnStartedAt,
   });
   gameStore.updatePlayers(table.gameId, {
-    w: table.seats.w?.name ?? null,
-    b: table.seats.b?.name ?? null,
+    w: table.playerNames.w,
+    b: table.playerNames.b,
   });
   if (table.bot) {
     gameStore.setBot(table.gameId, {
@@ -965,6 +1032,8 @@ function resetTable(table, swapSeats) {
     }
   }
   resumeClock(table);
+  if (table.mode === "correspondence")
+    gameStore.setTurnStartedAt(table.gameId, table.turnStartedAt);
   if (swapSeats && !table.bot) {
     for (const color of ["w", "b"]) {
       const seated = table.seats[color];
@@ -1006,12 +1075,18 @@ async function joinTable(request, socket) {
   const playerKey = (url.searchParams.get("playerKey") || "")
     .replace(/[^a-zA-Z0-9-]/g, "")
     .slice(0, 64);
+  const mode = url.searchParams.get("mode") === "correspondence"
+    ? "correspondence"
+    : "live";
   const requestedTime = Number(url.searchParams.get("time"));
-  const initialTimeMs = STARTING_TIMES.has(requestedTime)
-    ? requestedTime
-    : DEFAULT_STARTING_TIME;
+  const initialTimeMs =
+    mode === "correspondence"
+      ? CORRESPONDENCE_TURN_MS
+      : STARTING_TIMES.has(requestedTime)
+        ? requestedTime
+        : DEFAULT_STARTING_TIME;
 
-  const table = await obtainTable(roomId, initialTimeMs);
+  const table = await obtainTable(roomId, initialTimeMs, mode);
   if (socket.readyState !== socket.OPEN) return;
 
   replacePlayerConnection(table, playerKey);
@@ -1027,6 +1102,7 @@ async function joinTable(request, socket) {
   table.clients.add(client);
   if (role === "w" || role === "b") {
     table.seats[role] = client;
+    table.playerNames[role] = name;
     if (playerKey) {
       table.playerColors.set(playerKey, role);
       gameStore.addPlayer(table.gameId, playerKey, role);
@@ -1068,11 +1144,17 @@ async function joinTable(request, socket) {
     }
   }
   gameStore.updatePlayers(table.gameId, {
-    w: table.seats.w?.name ?? null,
-    b: table.seats.b?.name ?? null,
+    w: table.playerNames.w,
+    b: table.playerNames.b,
   });
   table.touchedAt = Date.now();
-  if (!table.clock.running) resumeClock(table);
+  if (flagIfExpired(table)) captureFinishedGame(table);
+  else if (!table.clock.running) {
+    const before = table.turnStartedAt;
+    resumeClock(table);
+    if (before !== table.turnStartedAt)
+      gameStore.setTurnStartedAt(table.gameId, table.turnStartedAt);
+  }
 
   socket.on("message", (data, isBinary) => {
     if (!isBinary) handleTableMessage(table, client, data.toString());
@@ -1097,7 +1179,15 @@ setInterval(
   () => {
     const now = Date.now();
     for (const [id, table] of tables) {
-      if (table.clients.size === 0 && now - table.touchedAt > IDLE_ROOM_TTL) {
+      if (flagIfExpired(table)) {
+        captureFinishedGame(table);
+        broadcast(table);
+      }
+      const ttl =
+        table.mode === "correspondence"
+          ? CORRESPONDENCE_GAME_TTL
+          : IDLE_ROOM_TTL;
+      if (table.clients.size === 0 && now - table.touchedAt > ttl) {
         if (!table.sentryTraceEnded) table.sentrySpan.end();
         tables.delete(id);
       }

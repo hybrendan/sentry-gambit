@@ -87,6 +87,8 @@ export function openFirestoreGameStore() {
             whiteTimeMs: game.clock.w,
             blackTimeMs: game.clock.b,
             initialTimeMs: game.initialTimeMs ?? game.clock.w,
+            gameMode: game.mode ?? "live",
+            turnStartedAt: game.turnStartedAt ?? null,
             playerKeys: [],
             plyCount: 0,
             shareable: true,
@@ -115,6 +117,11 @@ export function openFirestoreGameStore() {
         }),
       );
     },
+    setTurnStartedAt(gameId, turnStartedAt) {
+      enqueue(gameId, () =>
+        games.doc(gameId).update({ turnStartedAt, updatedAt: Date.now() }),
+      );
+    },
     addPlayer(gameId, playerKey, color) {
       enqueue(gameId, () =>
         games.doc(gameId).update({
@@ -124,7 +131,7 @@ export function openFirestoreGameStore() {
         }),
       );
     },
-    recordMove(gameId, ply, move, fen, clock) {
+    recordMove(gameId, ply, move, fen, clock, turnStartedAt = null) {
       const now = Date.now();
       enqueue(gameId, () => {
         const batch = firestore.batch();
@@ -142,13 +149,14 @@ export function openFirestoreGameStore() {
           finalFen: fen,
           whiteTimeMs: clock.w,
           blackTimeMs: clock.b,
+          turnStartedAt,
           plyCount: ply,
           updatedAt: now,
         });
         return batch.commit();
       });
     },
-    undoMoves(gameId, fromPly, fen, clock) {
+    undoMoves(gameId, fromPly, fen, clock, turnStartedAt = null) {
       const now = Date.now();
       enqueue(gameId, async () => {
         const stale = await games
@@ -162,6 +170,7 @@ export function openFirestoreGameStore() {
           finalFen: fen,
           whiteTimeMs: clock.w,
           blackTimeMs: clock.b,
+          turnStartedAt,
           plyCount: fromPly - 1,
           updatedAt: now,
         });
@@ -282,7 +291,7 @@ export function openFirestoreGameStore() {
         history: moves.docs.map((moveDoc) => mapMove(moveDoc.data())),
       };
     },
-    async getLiveGame(room, maxAgeMs) {
+    async getLiveGame(room, maxAgeMs, correspondenceMaxAgeMs = maxAgeMs) {
       const snapshot = await games
         .where("room", "==", room)
         .where("status", "==", "in_progress")
@@ -291,12 +300,19 @@ export function openFirestoreGameStore() {
         .sort((a, b) => (b.data().updatedAt ?? 0) - (a.data().updatedAt ?? 0))[0];
       if (!doc) return null;
       const data = doc.data();
-      if (Date.now() - data.updatedAt > maxAgeMs) return null;
+      const maxAge =
+        data.gameMode === "correspondence"
+          ? correspondenceMaxAgeMs
+          : maxAgeMs;
+      if (Date.now() - data.updatedAt > maxAge) return null;
       const moves = await games.doc(doc.id).collection("moves").orderBy("ply").get();
       return {
         id: doc.id,
         room: data.room,
+        players: { w: data.whiteName ?? null, b: data.blackName ?? null },
         initialTimeMs: data.initialTimeMs ?? 600_000,
+        mode: data.gameMode ?? "live",
+        turnStartedAt: data.turnStartedAt ?? null,
         clock: { w: data.whiteTimeMs, b: data.blackTimeMs },
         playerColors: data.playerColors ?? {},
         seatUsers: {

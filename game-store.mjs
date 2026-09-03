@@ -28,6 +28,8 @@ export function openGameStore(databasePath = DEFAULT_DATABASE_PATH) {
       white_time_ms INTEGER NOT NULL,
       black_time_ms INTEGER NOT NULL,
       initial_time_ms INTEGER NOT NULL DEFAULT 600000,
+      game_mode TEXT NOT NULL DEFAULT 'live',
+      turn_started_at INTEGER,
       shareable INTEGER NOT NULL DEFAULT 1
     );
 
@@ -94,6 +96,12 @@ export function openGameStore(databasePath = DEFAULT_DATABASE_PATH) {
       "ALTER TABLE games ADD COLUMN initial_time_ms INTEGER NOT NULL DEFAULT 600000",
     );
   }
+  if (!gameColumns.some((column) => column.name === "game_mode")) {
+    database.exec("ALTER TABLE games ADD COLUMN game_mode TEXT NOT NULL DEFAULT 'live'");
+  }
+  if (!gameColumns.some((column) => column.name === "turn_started_at")) {
+    database.exec("ALTER TABLE games ADD COLUMN turn_started_at INTEGER");
+  }
   if (!gameColumns.some((column) => column.name === "white_user_id")) {
     database.exec("ALTER TABLE games ADD COLUMN white_user_id TEXT");
     database.exec("ALTER TABLE games ADD COLUMN black_user_id TEXT");
@@ -108,8 +116,8 @@ export function openGameStore(databasePath = DEFAULT_DATABASE_PATH) {
     insertGame: database.prepare(`
       INSERT OR IGNORE INTO games (
         id, room, started_at, updated_at, final_fen, white_time_ms, black_time_ms,
-        initial_time_ms, shareable
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+        initial_time_ms, game_mode, turn_started_at, shareable
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
     `),
     updatePlayers: database.prepare(`
       UPDATE games SET white_name = ?, black_name = ?, updated_at = ? WHERE id = ?
@@ -120,13 +128,17 @@ export function openGameStore(databasePath = DEFAULT_DATABASE_PATH) {
     setBot: database.prepare(`
       UPDATE games SET bot_key = ?, bot_color = ?, bot_coach = ?, updated_at = ? WHERE id = ?
     `),
+    setTurnStartedAt: database.prepare(
+      "UPDATE games SET turn_started_at = ?, updated_at = ? WHERE id = ?",
+    ),
     insertMove: database.prepare(`
       INSERT OR REPLACE INTO moves (
         game_id, ply, color, san, from_square, to_square, promotion, fen_after, played_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     updatePosition: database.prepare(`
-      UPDATE games SET final_fen = ?, white_time_ms = ?, black_time_ms = ?, updated_at = ?
+      UPDATE games SET final_fen = ?, white_time_ms = ?, black_time_ms = ?,
+        turn_started_at = ?, updated_at = ?
       WHERE id = ?
     `),
     finishGame: database.prepare(`
@@ -195,9 +207,9 @@ export function openGameStore(databasePath = DEFAULT_DATABASE_PATH) {
       "UPDATE moves SET analysis = ? WHERE game_id = ? AND ply = ?",
     ),
     selectLiveGame: database.prepare(`
-      SELECT id, room, white_time_ms, black_time_ms, initial_time_ms,
-        bot_key, bot_color, bot_coach, white_user_id, black_user_id
-      FROM games WHERE room = ? AND status = 'in_progress' AND updated_at >= ?
+      SELECT id, room, white_name, black_name, white_time_ms, black_time_ms, initial_time_ms, game_mode,
+        turn_started_at, updated_at, bot_key, bot_color, bot_coach, white_user_id, black_user_id
+      FROM games WHERE room = ? AND status = 'in_progress'
       ORDER BY updated_at DESC LIMIT 1
     `),
     selectPlayerColors: database.prepare(`
@@ -289,6 +301,8 @@ export function openGameStore(databasePath = DEFAULT_DATABASE_PATH) {
         game.clock.w,
         game.clock.b,
         game.initialTimeMs ?? game.clock.w,
+        game.mode ?? "live",
+        game.turnStartedAt ?? null,
       );
     },
     updatePlayers(gameId, players) {
@@ -300,24 +314,41 @@ export function openGameStore(databasePath = DEFAULT_DATABASE_PATH) {
     setBot(gameId, bot) {
       statements.setBot.run(bot.key, bot.color, bot.coach ? 1 : 0, Date.now(), gameId);
     },
-    recordMove(gameId, ply, move, fen, clock) {
+    setTurnStartedAt(gameId, turnStartedAt) {
+      statements.setTurnStartedAt.run(turnStartedAt, Date.now(), gameId);
+    },
+    recordMove(gameId, ply, move, fen, clock, turnStartedAt = null) {
       const now = Date.now();
       database.exec("BEGIN IMMEDIATE");
       try {
         statements.insertMove.run(gameId, ply, move.color, move.san, move.from, move.to, move.promotion ?? null, fen, now);
-        statements.updatePosition.run(fen, clock.w, clock.b, now, gameId);
+        statements.updatePosition.run(
+          fen,
+          clock.w,
+          clock.b,
+          turnStartedAt,
+          now,
+          gameId,
+        );
         database.exec("COMMIT");
       } catch (error) {
         database.exec("ROLLBACK");
         throw error;
       }
     },
-    undoMoves(gameId, fromPly, fen, clock) {
+    undoMoves(gameId, fromPly, fen, clock, turnStartedAt = null) {
       const now = Date.now();
       database.exec("BEGIN IMMEDIATE");
       try {
         statements.deleteMovesFrom.run(gameId, fromPly);
-        statements.updatePosition.run(fen, clock.w, clock.b, now, gameId);
+        statements.updatePosition.run(
+          fen,
+          clock.w,
+          clock.b,
+          turnStartedAt,
+          now,
+          gameId,
+        );
         database.exec("COMMIT");
       } catch (error) {
         database.exec("ROLLBACK");
@@ -382,9 +413,14 @@ export function openGameStore(databasePath = DEFAULT_DATABASE_PATH) {
         history: statements.selectMoves.all(gameId).map(mapMove),
       };
     },
-    getLiveGame(room, maxAgeMs) {
-      const row = statements.selectLiveGame.get(room, Date.now() - maxAgeMs);
+    getLiveGame(room, maxAgeMs, correspondenceMaxAgeMs = maxAgeMs) {
+      const row = statements.selectLiveGame.get(room);
       if (!row) return null;
+      const maxAge =
+        row.game_mode === "correspondence"
+          ? correspondenceMaxAgeMs
+          : maxAgeMs;
+      if (Date.now() - row.updated_at > maxAge) return null;
       const playerColors = {};
       for (const player of statements.selectPlayerColors.all(row.id)) {
         playerColors[player.player_key] = player.color;
@@ -392,7 +428,10 @@ export function openGameStore(databasePath = DEFAULT_DATABASE_PATH) {
       return {
         id: row.id,
         room: row.room,
+        players: { w: row.white_name, b: row.black_name },
         initialTimeMs: row.initial_time_ms,
+        mode: row.game_mode,
+        turnStartedAt: row.turn_started_at ?? null,
         clock: { w: row.white_time_ms, b: row.black_time_ms },
         playerColors,
         seatUsers: { w: row.white_user_id, b: row.black_user_id },
