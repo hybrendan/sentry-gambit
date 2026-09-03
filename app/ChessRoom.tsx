@@ -1675,7 +1675,7 @@ export function ChessRoom() {
                     />
                   </label>
                 )}
-                <fieldset className="time-control">
+                <fieldset className="time-control game-mode-control">
                   <legend>Game pace</legend>
                   <div>
                     <button
