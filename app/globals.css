@@ -130,7 +130,7 @@ button { color: inherit; }
 .chessboard { --board-border: 9px; position: relative; width: 100%; aspect-ratio: 1; box-sizing: border-box; background: var(--green-deep); box-shadow: inset 0 0 0 var(--board-border) var(--green-deep); }
 .chessground-surface { position: absolute; inset: var(--board-border); }
 .chessground-surface cg-container { top: 50%; left: 50%; transform: translate(-50%, -50%); }
-.chessboard cg-board { background-color: #e8dfc9; background-image: conic-gradient(#e8dfc9 25%, #638376 0 50%, #e8dfc9 0 75%, #638376 0); background-size: 25% 25%; }
+.chessboard cg-board { background-color: #638376; background-image: conic-gradient(#638376 25%, #e8dfc9 0 50%, #638376 0 75%, #e8dfc9 0); background-size: 25% 25%; }
 .chessboard cg-board square.move-dest { background: radial-gradient(rgba(12,47,40,.47) 22%, transparent 23%); }
 .chessboard cg-board square.move-dest:hover { background: rgba(201,192,209,.42); }
 .chessboard cg-board square.oc.move-dest { background: radial-gradient(transparent 0 76%, rgba(201,192,209,.7) 77% 84%, transparent 85%); }
