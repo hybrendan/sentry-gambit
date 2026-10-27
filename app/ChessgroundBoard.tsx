@@ -69,7 +69,7 @@ export function ChessgroundBoard({
       coordinatesOnSquares: true,
       disableContextMenu: true,
       drawable: {
-        enabled: false,
+        enabled: true,
         visible: true,
         brushes: {
           green: { key: "g", color: "#15781b", opacity: 1, lineWidth: 10 },

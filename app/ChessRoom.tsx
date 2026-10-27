@@ -1173,12 +1173,12 @@ export function ChessRoom() {
     state?.coach && state.bot && !state.result && role !== "spectator",
   );
 
-  // Easter egg: mashing the logo mid-PvP-game summons a mini seer with hints.
-  const pvpLive = Boolean(
-    state && !state.bot && !state.result && role !== "spectator",
+  // Easter egg: mashing the logo mid-game summons a mini seer with hints.
+  const gameLive = Boolean(
+    state && !state.result && role !== "spectator",
   );
   function handleBrandClick(event: React.MouseEvent) {
-    if (!pvpLive) return;
+    if (!gameLive) return;
     event.preventDefault();
     const clicks = brandClicksRef.current;
     const now = Date.now();
@@ -1415,7 +1415,7 @@ export function ChessRoom() {
         onBrandClick={handleBrandClick}
       />
 
-      {miniSeerOpen && pvpLive && (
+      {miniSeerOpen && gameLive && (
         <aside className="mini-seer" role="dialog" aria-label="Mini seer">
           <div className="mini-seer-head">
             <span className="seer-eye">
